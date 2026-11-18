@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dbc-tests:
+    name: DBC- und Transporttests (Paket A)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tests/requirements.txt
+
+      - name: Abhängigkeiten installieren
+        run: pip install -r tests/requirements.txt
+
+      - name: Tests ausführen
+        run: pytest -v --junitxml=test-results/dbc-tests.xml
+
+      - name: Testbericht hochladen
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbc-test-report
+          path: test-results/
