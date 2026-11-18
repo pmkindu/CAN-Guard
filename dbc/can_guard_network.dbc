@@ -31,14 +31,14 @@ BO_ 257 SENSOR_NODE_1: 3 Node1
 BO_ 258 SENSOR_NODE_2: 2 Node2
  SG_ Ultrasonic_Distance : 0|16@1+ (1,0) [0|400] "cm" PC_Analyzer
 
-BO_ 259 SENSOR_NODE_3_S1: 2 Node3
+BO_ 259 SENSOR_NODE_3_S1: 4 Node3
  SG_ DHT11_1_Temp : 0|16@1- (0.1,0) [-20|60] "°C" PC_Analyzer
  SG_ DHT11_1_Hum : 16|16@1+ (0.1,0) [0|100] "%" PC_Analyzer
 
-BO_ 260 SENSOR_NODE_3_S2: 2 Node3
+BO_ 260 SENSOR_NODE_3_S2: 4 Node3
  SG_ DHT11_2_Temp : 0|16@1- (0.1,0) [-20|60] "°C" PC_Analyzer
  SG_ DHT11_2_Hum : 16|16@1+ (0.1,0) [0|100] "%" PC_Analyzer
 
-BO_ 261 SENSOR_NODE_3_S3: 2 Node3
- SG_ DHT11_3_Temp : 0|16@1- (1,0) [-20|60] "°C" PC_Analyzer
- SG_ DHT11_3_Hum : 16|16@1+ (1,0) [0|100] "%" PC_Analyzer
+BO_ 261 SENSOR_NODE_3_S3: 4 Node3
+ SG_ DHT11_3_Temp : 0|16@1- (0.1,0) [-20|60] "°C" PC_Analyzer
+ SG_ DHT11_3_Hum : 16|16@1+ (0.1,0) [0|100] "%" PC_Analyzer

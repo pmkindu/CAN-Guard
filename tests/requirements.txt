@@ -1,0 +1,4 @@
+# Feste Versionen, damit CI und lokaler Lauf identisch prüfen
+cantools==45.2.0
+python-can==4.6.1
+pytest==9.1.1
