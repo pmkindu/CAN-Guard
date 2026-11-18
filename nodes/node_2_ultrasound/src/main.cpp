@@ -3,25 +3,21 @@
 #include <mcp2515.h>
 #include <avr/interrupt.h>
 #include <util/atomic.h>
+#include <Adafruit_NeoPixel.h>
 
 // ============================================================
-// CAN-Guard - Node 2
-// Arduino Nano V3 / ATmega328P
-// HW-184 mit MCP2515, 8-MHz-Quarz
-//
+// CAN-Guard - Node 2 (Roadmap v4.2)
+// Arduino Nano V3 / ATmega328P + HW-184 MCP2515 (8 MHz)
+// 
 // Verkabelung:
 //   HC-SR04 Trig: D4
-//   HC-SR04 Echo: D5
+//   HC-SR04 Echo: D5 (PCINT21)
+//   WS2812 Ring:  D6 (16x 5050, integrierter Treiber)
 //   MCP2515 CS:   D10
-//   MCP2515 MOSI: D11
-//   MCP2515 MISO: D12
-//   MCP2515 SCK:  D13
-//   MCP2515 INT:  D2, in diesem Sketch nicht ausgewertet
+//   MCP2515 INT:  D2 (in dieser Firmware gepollt/optional)
 //
 // Sensornachricht 0x102, DLC 2, alle 250 ms:
-//   B0: Distanz Low-Byte
-//   B1: Distanz High-Byte
-//   Einheit: ganze Zentimeter
+//   B0-B1: Distanz in cm (uint16, Little Endian)
 //   0xFFFF: kein gueltiger Distanzwert
 //
 // Diagnose 0x1F2, DLC 4:
@@ -30,26 +26,21 @@
 //   B2: 2 = kein Echo/Timeout, 3 = ausserhalb Bereich
 //   B3: Ereigniszaehler
 //
-// Serieller Monitor: 115200 Baud
-//   s = Status anzeigen
-//
-// Echo-Erfassung ueber Pin-Change-Interrupt:
-//   D5 = PD5 = PCINT21
-//   Interruptvektor: PCINT2_vect
-//
-// Keine weitere Bibliothek darf denselben Interruptvektor
-// definieren.
+// Serieller Monitor (115200 Baud):
+//   s = Status (inkl. CAN-Infos und Ultraschallwert) anzeigen
 // ============================================================
 
-
-// -------------------- Hardware --------------------
+// -------------------- Hardware & Pins --------------------
 
 constexpr uint8_t PIN_TRIG = 4;
 constexpr uint8_t PIN_ECHO = 5;
+constexpr uint8_t PIN_LED_RING = 6;
 constexpr uint8_t PIN_CS = 10;
 
-MCP2515 mcp2515(PIN_CS);
+constexpr uint16_t NUM_LEDS = 16;
+Adafruit_NeoPixel strip(NUM_LEDS, PIN_LED_RING, NEO_GRB + NEO_KHZ800);
 
+MCP2515 mcp2515(PIN_CS);
 
 // -------------------- CAN-Protokoll --------------------
 
@@ -66,7 +57,6 @@ constexpr uint8_t ERROR_RANGE = 0x03;
 
 constexpr uint16_t INVALID_DISTANCE = 0xFFFF;
 
-
 // -------------------- Messparameter --------------------
 
 constexpr uint32_t MEASURE_INTERVAL_MS = 250;
@@ -75,7 +65,6 @@ constexpr uint32_t ECHO_TIMEOUT_US = 30000;
 
 constexpr uint16_t MIN_DISTANCE_CM = 2;
 constexpr uint16_t MAX_DISTANCE_CM = 400;
-
 
 // -------------------- Diagnoseparameter --------------------
 
@@ -87,12 +76,10 @@ constexpr uint32_t DIAG_MIN_GAP_MS = 200;
 
 constexpr uint8_t DIAG_QUEUE_SIZE = 4;
 
-
 // -------------------- Weitere Zeitparameter --------------------
 
 constexpr uint32_t INIT_RETRY_MS = 2000;
 constexpr uint32_t STATUS_INTERVAL_MS = 5000;
-
 
 // -------------------- Echo-Erfassung --------------------
 
@@ -110,7 +97,6 @@ volatile uint32_t echoWidthUs = 0;
 bool measurementRunning = false;
 uint32_t measurementStartedUs = 0;
 
-
 // -------------------- Messwerte und Fehlerzustand --------------------
 
 uint16_t distanceCm = INVALID_DISTANCE;
@@ -121,9 +107,7 @@ uint8_t validCount = 0;
 
 bool sensorErrorActive = false;
 uint8_t activeErrorCode = ERROR_TIMEOUT;
-
 uint8_t eventCounter = 0;
-
 
 // -------------------- Diagnosewarteschlange --------------------
 
@@ -134,12 +118,9 @@ struct DiagnosticEvent {
 };
 
 DiagnosticEvent diagQueue[DIAG_QUEUE_SIZE];
-
 uint8_t queueHead = 0;
 uint8_t queueCount = 0;
-
 uint32_t queueOverflows = 0;
-
 
 // -------------------- CAN- und Zeitstatus --------------------
 
@@ -154,20 +135,12 @@ uint32_t lastStatusMs = 0;
 uint32_t lastDiagAttemptMs = 0;
 uint32_t lastDiagAcceptedMs = 0;
 
-
-// -------------------- Statistik --------------------
-
-// "Accepted" bedeutet ERROR_OK von sendMessage().
-// Es ist kein Empfangsnachweis durch das Gateway.
-
 uint32_t sensorTxAccepted = 0;
 uint32_t sensorTxErrors = 0;
-
 uint32_t diagTxAccepted = 0;
 uint32_t diagTxErrors = 0;
 
-
-// -------------------- Echo-Interrupt an D5 --------------------
+// -------------------- ISR für Echo (D5) --------------------
 
 ISR(PCINT2_vect) {
   const bool echoHigh = (PIND & _BV(PD5)) != 0;
@@ -175,24 +148,52 @@ ISR(PCINT2_vect) {
   if (echoState == ECHO_WAIT_RISE && echoHigh) {
     echoRiseUs = micros();
     echoState = ECHO_WAIT_FALL;
-
   } else if (echoState == ECHO_WAIT_FALL && !echoHigh) {
-    echoWidthUs =
-        static_cast<uint32_t>(micros() - echoRiseUs);
-
+    echoWidthUs = static_cast<uint32_t>(micros() - echoRiseUs);
     echoState = ECHO_COMPLETE;
   }
 }
 
+// -------------------- Hilfsfunktionen --------------------
 
-// -------------------- Zeitvergleich --------------------
-
-bool elapsed(uint32_t now,
-             uint32_t previous,
-             uint32_t interval) {
+bool elapsed(uint32_t now, uint32_t previous, uint32_t interval) {
   return static_cast<uint32_t>(now - previous) >= interval;
 }
 
+// -------------------- WS2812 LED-Ring Steuerung (v4.2) --------------------
+
+void updateLedRing(uint16_t dist) {
+  strip.clear();
+
+  if (dist == INVALID_DISTANCE || dist > 50) {
+    // > 50 cm oder ungültig: Alle LEDs aus
+    strip.show();
+    return;
+  }
+
+  uint8_t activeLeds = 0;
+  uint32_t color = 0;
+
+  if (dist <= 10) {
+    activeLeds = 16;
+    color = strip.Color(255, 0, 0);       // Rot (<= 10 cm)
+  } else if (dist <= 20) {
+    activeLeds = 12;
+    color = strip.Color(255, 100, 0);     // Orange (<= 20 cm)
+  } else if (dist <= 30) {
+    activeLeds = 8;
+    color = strip.Color(0, 255, 0);       // Grün (<= 30 cm)
+  } else { // <= 40 cm
+    activeLeds = 4;
+    color = strip.Color(0, 255, 0);       // Grün (<= 40 cm)
+  }
+
+  // Iterativ im Uhrzeigersinn leuchten lassen
+  for (uint8_t i = 0; i < activeLeds && i < NUM_LEDS; i++) {
+    strip.setPixelColor(i, color);
+  }
+  strip.show();
+}
 
 // -------------------- CAN initialisieren --------------------
 
@@ -202,8 +203,7 @@ bool initializeCan() {
     return false;
   }
 
-  if (mcp2515.setBitrate(CAN_500KBPS, MCP_8MHZ)
-      != MCP2515::ERROR_OK) {
+  if (mcp2515.setBitrate(CAN_500KBPS, MCP_8MHZ) != MCP2515::ERROR_OK) {
     Serial.println(F("[CAN] Bitratenkonfiguration fehlgeschlagen."));
     return false;
   }
@@ -217,76 +217,48 @@ bool initializeCan() {
   return true;
 }
 
-
 // -------------------- Diagnose vormerken --------------------
 
-void enqueueDiagnostic(uint8_t eventType,
-                       uint8_t errorCode) {
+void enqueueDiagnostic(uint8_t eventType, uint8_t errorCode) {
   if (queueCount == DIAG_QUEUE_SIZE) {
-    // Bei voller Queue aeltestes Ereignis verwerfen.
-    // Der neueste Zustand bleibt erhalten.
-    queueHead =
-        static_cast<uint8_t>((queueHead + 1) % DIAG_QUEUE_SIZE);
-
+    queueHead = static_cast<uint8_t>((queueHead + 1) % DIAG_QUEUE_SIZE);
     queueCount--;
     queueOverflows++;
   }
 
-  const uint8_t tail =
-      static_cast<uint8_t>(
-          (queueHead + queueCount) % DIAG_QUEUE_SIZE);
-
+  const uint8_t tail = static_cast<uint8_t>((queueHead + queueCount) % DIAG_QUEUE_SIZE);
   diagQueue[tail].eventType = eventType;
   diagQueue[tail].errorCode = errorCode;
-
-  // Nur Zustandswechsel erhoehen den Ereigniszaehler.
   eventCounter++;
   diagQueue[tail].counter = eventCounter;
-
   queueCount++;
 }
 
-
 // -------------------- Messergebnis auswerten --------------------
 
-void applyMeasurement(bool valid,
-                      uint16_t measuredCm,
-                      uint8_t errorCode) {
-  // Messwert wird sofort gueltig/ungueltig.
-  // Diagnosezustand wird getrennt davon entprellt.
+void applyMeasurement(bool valid, uint16_t measuredCm, uint8_t errorCode) {
   distanceCm = valid ? measuredCm : INVALID_DISTANCE;
+  updateLedRing(distanceCm); // Lokale Aktorik sofort aktualisieren
 
   if (valid) {
     invalidCount = 0;
-
-    if (validCount < VALID_LIMIT) {
-      validCount++;
-    }
+    if (validCount < VALID_LIMIT) validCount++;
 
     if (sensorErrorActive && validCount >= VALID_LIMIT) {
       sensorErrorActive = false;
-
       enqueueDiagnostic(EVENT_CLEARED, activeErrorCode);
     }
-
   } else {
     validCount = 0;
-
-    if (invalidCount < INVALID_LIMIT) {
-      invalidCount++;
-    }
+    if (invalidCount < INVALID_LIMIT) invalidCount++;
 
     if (!sensorErrorActive && invalidCount >= INVALID_LIMIT) {
       sensorErrorActive = true;
-
-      // Ausloesende Ursache bis zur Behebung speichern.
       activeErrorCode = errorCode;
-
       enqueueDiagnostic(EVENT_ACTIVE, activeErrorCode);
     }
   }
 }
-
 
 // -------------------- Messung starten --------------------
 
@@ -297,9 +269,6 @@ void startMeasurement() {
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
     echoState = ECHO_IDLE;
     echoWidthUs = 0;
-
-    // Nur bei anfangs LOW liegendem Echo eine neue
-    // steigende Flanke akzeptieren.
     if ((PIND & _BV(PD5)) == 0) {
       echoState = ECHO_WAIT_RISE;
     }
@@ -307,13 +276,10 @@ void startMeasurement() {
 
   digitalWrite(PIN_TRIG, LOW);
   delayMicroseconds(2);
-
   digitalWrite(PIN_TRIG, HIGH);
   delayMicroseconds(10);
-
   digitalWrite(PIN_TRIG, LOW);
 }
-
 
 // -------------------- Messung bearbeiten --------------------
 
@@ -321,21 +287,15 @@ void serviceMeasurement(uint32_t nowMs) {
   if (measurementRunning) {
     bool completed = false;
     bool timedOut = false;
-
     uint32_t widthUs = 0;
 
-    const bool timeoutDue =
-        elapsed(micros(),
-                measurementStartedUs,
-                ECHO_TIMEOUT_US);
+    const bool timeoutDue = elapsed(micros(), measurementStartedUs, ECHO_TIMEOUT_US);
 
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
       if (echoState == ECHO_COMPLETE) {
         widthUs = echoWidthUs;
-
         echoState = ECHO_IDLE;
         completed = true;
-
       } else if (timeoutDue) {
         echoState = ECHO_IDLE;
         timedOut = true;
@@ -346,120 +306,75 @@ void serviceMeasurement(uint32_t nowMs) {
       measurementRunning = false;
       lastPulseUs = widthUs;
 
-      // Bereich vor der Rundung pruefen.
-      const bool inRange =
-          widthUs >=
-              static_cast<uint32_t>(MIN_DISTANCE_CM) * 58UL &&
-          widthUs <=
-              static_cast<uint32_t>(MAX_DISTANCE_CM) * 58UL;
+      const bool inRange = widthUs >= static_cast<uint32_t>(MIN_DISTANCE_CM) * 58UL &&
+                           widthUs <= static_cast<uint32_t>(MAX_DISTANCE_CM) * 58UL;
 
       if (inRange) {
-        const uint16_t measuredCm =
-            static_cast<uint16_t>((widthUs + 29UL) / 58UL);
-
+        const uint16_t measuredCm = static_cast<uint16_t>((widthUs + 29UL) / 58UL);
         applyMeasurement(true, measuredCm, 0);
-
       } else {
-        applyMeasurement(false,
-                         INVALID_DISTANCE,
-                         ERROR_RANGE);
+        applyMeasurement(false, INVALID_DISTANCE, ERROR_RANGE);
       }
-
     } else if (timedOut) {
       measurementRunning = false;
       lastPulseUs = 0;
-
-      applyMeasurement(false,
-                       INVALID_DISTANCE,
-                       ERROR_TIMEOUT);
+      applyMeasurement(false, INVALID_DISTANCE, ERROR_TIMEOUT);
     }
   }
 
-  if (!measurementRunning &&
-      elapsed(nowMs, lastMeasureMs, MEASURE_INTERVAL_MS)) {
+  if (!measurementRunning && elapsed(nowMs, lastMeasureMs, MEASURE_INTERVAL_MS)) {
     lastMeasureMs = nowMs;
     startMeasurement();
   }
 }
 
-
 // -------------------- Sensornachricht senden --------------------
 
 void sendSensorFrame(uint32_t nowMs) {
-  if (!canReady ||
-      !elapsed(nowMs, lastSendMs, SEND_INTERVAL_MS)) {
+  if (!canReady || !elapsed(nowMs, lastSendMs, SEND_INTERVAL_MS)) {
     return;
   }
-
   lastSendMs = nowMs;
 
   struct can_frame frame = {};
-
   frame.can_id = CAN_ID_SENSOR;
   frame.can_dlc = 2;
+  frame.data[0] = static_cast<uint8_t>(distanceCm & 0xFF);
+  frame.data[1] = static_cast<uint8_t>((distanceCm >> 8) & 0xFF);
 
-  // Little Endian.
-  frame.data[0] =
-      static_cast<uint8_t>(distanceCm & 0xFF);
-
-  frame.data[1] =
-      static_cast<uint8_t>((distanceCm >> 8) & 0xFF);
-
-  const MCP2515::ERROR result =
-      mcp2515.sendMessage(&frame);
-
-  if (result == MCP2515::ERROR_OK) {
+  if (mcp2515.sendMessage(&frame) == MCP2515::ERROR_OK) {
     sensorTxAccepted++;
   } else {
     sensorTxErrors++;
   }
 }
 
-
 // -------------------- Diagnose senden --------------------
 
 void processDiagnostics(uint32_t nowMs) {
-  if (!canReady) {
-    return;
-  }
+  if (!canReady) return;
 
-  // Auch fehlgeschlagene Versuche begrenzen.
-  if (diagAttemptMade &&
-      !elapsed(nowMs,
-               lastDiagAttemptMs,
-               DIAG_MIN_GAP_MS)) {
+  if (diagAttemptMade && !elapsed(nowMs, lastDiagAttemptMs, DIAG_MIN_GAP_MS)) {
     return;
   }
 
   const bool queued = queueCount > 0;
+  const bool repeatDue = sensorErrorActive && elapsed(nowMs, lastDiagAcceptedMs, DIAG_REPEAT_MS);
 
-  const bool repeatDue =
-      sensorErrorActive &&
-      elapsed(nowMs,
-              lastDiagAcceptedMs,
-              DIAG_REPEAT_MS);
-
-  if (!queued && !repeatDue) {
-    return;
-  }
+  if (!queued && !repeatDue) return;
 
   DiagnosticEvent event;
-
   if (queued) {
     event = diagQueue[queueHead];
-
   } else {
-    // Aktiven Zustand wiederholen, Zaehler unveraendert.
     event.eventType = EVENT_ACTIVE;
     event.errorCode = activeErrorCode;
     event.counter = eventCounter;
   }
 
   struct can_frame frame = {};
-
   frame.can_id = CAN_ID_DIAG;
   frame.can_dlc = 4;
-
   frame.data[0] = SENSOR_ID;
   frame.data[1] = event.eventType;
   frame.data[2] = event.errorCode;
@@ -468,13 +383,8 @@ void processDiagnostics(uint32_t nowMs) {
   lastDiagAttemptMs = nowMs;
   diagAttemptMade = true;
 
-  const MCP2515::ERROR result =
-      mcp2515.sendMessage(&frame);
-
-  if (result != MCP2515::ERROR_OK) {
+  if (mcp2515.sendMessage(&frame) != MCP2515::ERROR_OK) {
     diagTxErrors++;
-
-    // Vorgemerktes Ereignis bleibt in der Queue.
     return;
   }
 
@@ -482,89 +392,48 @@ void processDiagnostics(uint32_t nowMs) {
   lastDiagAcceptedMs = nowMs;
 
   if (queued) {
-    queueHead =
-        static_cast<uint8_t>((queueHead + 1) % DIAG_QUEUE_SIZE);
-
+    queueHead = static_cast<uint8_t>((queueHead + 1) % DIAG_QUEUE_SIZE);
     queueCount--;
   }
-
-  Serial.print(F("[DIAG] Event=0x"));
-  Serial.print(event.eventType, HEX);
-
-  Serial.print(F(" Code=0x"));
-  Serial.print(event.errorCode, HEX);
-
-  Serial.print(F(" Counter="));
-  Serial.println(event.counter);
 }
 
-
-// -------------------- Empfangspuffer leeren --------------------
-
-void serviceCanReceive() {
-  if (!canReady) {
-    return;
-  }
-
-  struct can_frame frame;
-
-  for (uint8_t i = 0; i < 2; i++) {
-    if (mcp2515.readMessage(&frame) != MCP2515::ERROR_OK) {
-      break;
-    }
-  }
-}
-
-
-// -------------------- Status anzeigen --------------------
+// -------------------- Status anzeigen (inkl. CAN-Info & Ultraschall) --------------------
 
 void printStatus() {
-  Serial.print(F("[NODE2] Distanz="));
-
+  Serial.print(F("[NODE2] Distanz = "));
   if (distanceCm == INVALID_DISTANCE) {
-    Serial.print(F("--"));
+    Serial.print(F("-- (kein Wert)"));
   } else {
     Serial.print(distanceCm);
     Serial.print(F(" cm"));
   }
 
-  Serial.print(F(" Puls="));
+  Serial.print(F(" | Puls = "));
   Serial.print(lastPulseUs);
-
-  Serial.print(F(" us Fehler="));
+  Serial.print(F(" us | Sensor-Fehler = "));
   Serial.println(sensorErrorActive ? F("AKTIV") : F("NEIN"));
 
-  Serial.print(F("[TX] Sensor akzeptiert/Fehler="));
+  Serial.print(F("[TX] Sensor OK/Err = "));
   Serial.print(sensorTxAccepted);
-  Serial.print('/');
+  Serial.print(F("/"));
   Serial.print(sensorTxErrors);
-
-  Serial.print(F(" Diagnose akzeptiert/Fehler="));
+  Serial.print(F(" | Diag OK/Err = "));
   Serial.print(diagTxAccepted);
-  Serial.print('/');
+  Serial.print(F("/"));
   Serial.println(diagTxErrors);
 
-  Serial.print(F("[QUEUE] Belegt="));
-  Serial.print(queueCount);
-
-  Serial.print(F(" Ueberlaeufe="));
-  Serial.println(queueOverflows);
-
   if (canReady) {
-    Serial.print(F("[CAN] EFLG=0x"));
+    Serial.print(F("[CAN INFO] EFLG = 0x"));
     Serial.print(mcp2515.getErrorFlags(), HEX);
-
-    Serial.print(F(" TEC="));
+    Serial.print(F(" | TEC = "));
     Serial.print(mcp2515.errorCountTX());
-
-    Serial.print(F(" REC="));
+    Serial.print(F(" | REC = "));
     Serial.println(mcp2515.errorCountRX());
-
   } else {
-    Serial.println(F("[CAN] Nicht initialisiert."));
+    Serial.println(F("[CAN INFO] Nicht initialisiert."));
   }
+  Serial.println(F("--------------------------------------------------"));
 }
-
 
 // -------------------- Setup --------------------
 
@@ -573,11 +442,14 @@ void setup() {
 
   pinMode(PIN_TRIG, OUTPUT);
   digitalWrite(PIN_TRIG, LOW);
-
   pinMode(PIN_ECHO, INPUT);
 
-  // Echo an D5:
-  // D5 = PD5 = PCINT21, Interruptgruppe PCINT2.
+  // WS2812 LED-Ring initialisieren & Helligkeit auf sichere 35% drosseln
+  strip.begin();
+  strip.setBrightness(90); 
+  strip.show();
+
+  // Echo an D5 (PCINT21)
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
     PCMSK2 |= _BV(PCINT21);
     PCIFR = _BV(PCIF2);
@@ -588,23 +460,16 @@ void setup() {
   canReady = initializeCan();
 
   const uint32_t now = millis();
-
   lastMeasureMs = now;
   lastSendMs = now;
   lastInitAttemptMs = now;
   lastStatusMs = now;
 
-  Serial.println(F("[NODE2] HC-SR04: Trig D4, Echo D5"));
-  Serial.println(F("[NODE2] 0x102 / DLC 2 / 250 ms"));
-  Serial.println(F("[NODE2] Distanz: Little Endian"));
-  Serial.println(F("[NODE2] Diagnose: 0x1F2 / DLC 4"));
-  Serial.println(F("[NODE2] Ungueltige Distanz: 0xFFFF"));
-  Serial.println(F("[SERIAL] s = Status"));
+  Serial.println(F("[NODE2] HC-SR04 + WS2812 LED-Ring v4.2 gestartet"));
+  Serial.println(F("[SERIAL] s = Status (Ultraschall & CAN-Info ausgeben)"));
 
-  // Erste Messung vor dem ersten zyklischen Frame starten.
   startMeasurement();
 }
-
 
 // -------------------- Hauptschleife --------------------
 
@@ -613,27 +478,27 @@ void loop() {
 
   serviceMeasurement(now);
 
-  // Fehlgeschlagene Initialisierung erneut versuchen.
-  // Keine eigene automatische Bus-Off-Recovery.
-  if (!measurementRunning &&
-      !canReady &&
-      elapsed(now, lastInitAttemptMs, INIT_RETRY_MS)) {
+  if (!measurementRunning && !canReady && elapsed(now, lastInitAttemptMs, INIT_RETRY_MS)) {
     lastInitAttemptMs = now;
     canReady = initializeCan();
   }
 
-  serviceCanReceive();
+  // Empfangspuffer leeren
+  struct can_frame frame;
+  if (canReady) {
+    for (uint8_t i = 0; i < 2; i++) {
+      if (mcp2515.readMessage(&frame) != MCP2515::ERROR_OK) break;
+    }
+  }
+
   sendSensorFrame(now);
 
-  // Umfangreichere Ausgaben ausserhalb der Echo-Messung.
   if (!measurementRunning) {
     processDiagnostics(now);
 
     if (Serial.available() > 0) {
-      const char command =
-          static_cast<char>(Serial.read());
-
-      if (command == 's' || command == 'S') {
+      const char cmd = static_cast<char>(Serial.read());
+      if (cmd == 's' || cmd == 'S') {
         printStatus();
       }
     }
